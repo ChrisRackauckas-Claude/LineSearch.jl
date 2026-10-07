@@ -4,6 +4,7 @@ using LineSearch, LinearAlgebra, Reactant, ReactantCore, SciMLBase, Test
 cube(u, p) = u .^ 3 .- 2
 cube!(fu, u, p) = (fu .= u .^ 3 .- 2; nothing)
 trig(u, p) = sin.(u) .+ u ./ 2 .- p
+linear(u, p) = u .- p
 
 function residual(f, u, p)
     SciMLBase.isinplace(NonlinearProblem(f, u, p)) || return f(u, p)
@@ -22,7 +23,7 @@ function line_search(f, u, du, p, alg = RobustNonMonotoneLineSearch())
     cache = init(prob, alg, fu, u)
     LineSearch.callback_into_cache!(cache, fu)
     sol = solve!(cache, u, du)
-    return sol.step_size, sol.retcode == ReturnCode.Success
+    return sol.step_size, sol.retcode == ReturnCode.Success, cache.history
 end
 
 spectral_coefficient(Δu, Δf) = clamp_spectral(dot(Δu, Δu) / dot(Δu, Δf), Δf)
@@ -76,14 +77,38 @@ end
     ]
     @testset "$name" for (name, (f, u, p, alg, α_expected, ok_expected)) in cases
         du = -residual(f, u, p)
-        α_host, ok_host = line_search(f, u, du, p, alg)
+        α_host, ok_host, _ = line_search(f, u, du, p, alg)
         @test α_host == α_expected
         @test ok_host == ok_expected
-        α_jit, ok_jit = @jit line_search(
+        α_jit, ok_jit, _ = @jit line_search(
             f, Reactant.to_rarray(u), Reactant.to_rarray(du), p, alg
         )
         @test Float64(α_jit) ≈ α_expected
         @test Bool(ok_jit) == ok_expected
+    end
+end
+
+# Merits whose `sqrt(dot(x, x))` underflows to zero or overflows to `Inf`. Expected steps,
+# return codes and history are those of the host loop in LineSearch v0.1.19.
+@testset "compiled line search with finite extreme merits" begin
+    alg = RobustNonMonotoneLineSearch(; n_exp = 1, maxiters = 3)
+    cases = [
+        "Float64, small" => ([1.0e-200, 1.0e-200], [1.0e-199, 1.0e-199], 0.0, -0.1),
+        "Float32, small" => (Float32[1.0f-30, 1.0f-30], Float32[1.0f-29, 1.0f-29], 0.0f0, -0.1f0),
+        "Float64, large" => ([1.0e200, 1.0e200], [-1.0e200, -1.0e200], 0.0, 1.0),
+    ]
+    @testset "$name" for (name, (u, du, p, α_expected)) in cases
+        history_expected = fill(sqrt(2one(eltype(u))) * u[1], 10)
+        α_host, ok_host, history_host = line_search(linear, u, du, p, alg)
+        @test α_host == α_expected
+        @test ok_host
+        @test history_host ≈ history_expected
+        α_jit, ok_jit, history_jit = @jit line_search(
+            linear, Reactant.to_rarray(u), Reactant.to_rarray(du), p, alg
+        )
+        @test eltype(u)(α_jit) ≈ α_expected
+        @test Bool(ok_jit)
+        @test Array(history_jit) ≈ history_expected
     end
 end
 

@@ -33,9 +33,12 @@ Robust NonMonotone Line Search is a derivative free line search method from DF S
     algorithm. Defaults to `100`.
 
 The line search can be traced by `Reactant.@jit`/`@compile`, including inside a traced
-solver loop that carries its cache. The compiled search accepts the same step as the host
-one, but it evaluates both trial points of each iteration and does not count function
-evaluations in `stats`.
+solver loop that carries its cache. The compiled search follows the same acceptance rule
+and step-length updates as the host one, but it evaluates both trial points of each
+iteration, does not count function evaluations in `stats`, and returns a
+`LineSearch.TracedLineSearchSolution` with traced `step_size` and `retcode`. Its
+floating-point results can differ from the host's in the last bits, which can change the
+accepted step when a trial merit lies at the acceptance threshold.
 
 # Examples
 
@@ -100,7 +103,7 @@ function CommonSolve.init(
         return @fastmath norm(fu_cache)^alg.n_exp
     end
 
-    fn₁ = norm(fu)^alg.n_exp
+    fn₁ = merit_norm(fu)^alg.n_exp
     η_strategy = @closure (n, xₙ, fₙ) -> alg.η_strategy(fn₁, n, xₙ, fₙ)
 
     return RobustNonMonotoneLineSearchCache(
@@ -153,7 +156,7 @@ function callback_into_cache!(cache::RobustNonMonotoneLineSearchCache, fu)
         # `mod(n - 1, M) + 1 == mod1(n, M)` without branching on the traced `n`
         slot = mod(cache.nsteps - 1, cache.M) + 1
         cache.history = ifelse.(
-            (1:(cache.M)) .== slot, norm(fu)^cache.n_exp, cache.history
+            (1:(cache.M)) .== slot, scaled_norm(fu)^cache.n_exp, cache.history
         )
         cache.nsteps += 1
         return
@@ -213,7 +216,7 @@ function solve_traced(cache::RobustNonMonotoneLineSearchCache, u, du, T)
         iter = iter + 1
     end
 
-    return LineSearchSolution(
+    return TracedLineSearchSolution(
         ifelse(accepted, step, σ₁),
         ifelse(accepted, ReturnCode.Success, ReturnCode.Failure)
     )
@@ -221,5 +224,28 @@ end
 
 function traced_merit(f, p, u, du, α, fu_buf, n_exp)
     fu = evaluate_f!!(f, similar(fu_buf), u .+ α .* du, p)
-    return norm(fu)^n_exp
+    return scaled_norm(fu)^n_exp
+end
+
+# Reactant lowers `norm` to `sqrt(dot(x, x))`, which underflows and overflows for finite
+# inputs, so the compiled path scales by the largest entry as `LinearAlgebra` does.
+merit_norm(x) = ReactantCore.within_compile() ? scaled_norm(x) : norm(x)
+
+function scaled_norm(x)
+    s = maximum(abs, x)
+    unscalable = iszero(s) | !isfinite(s)
+    scaled = s * sqrt(sum(abs2, x ./ ifelse(unscalable, one(s), s)))
+    return ifelse(unscalable, s, scaled)
+end
+
+"""
+    TracedLineSearchSolution(step_size, retcode)
+
+What `solve!` of [`RobustNonMonotoneLineSearch`](@ref) returns inside a Reactant
+compilation: the fields of [`LineSearchSolution`](@ref) without `ϕ` and `dϕ`, with a
+traced `step_size` and a traced `SciMLBase.ReturnCode`.
+"""
+struct TracedLineSearchSolution{S, R}
+    step_size::S
+    retcode::R
 end

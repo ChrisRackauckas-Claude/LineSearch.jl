@@ -6,7 +6,6 @@ using ConcreteStructs: @concrete
 using FastClosures: @closure
 using LinearAlgebra: norm, dot
 using MaybeInplace: @bb
-using ReactantCore: ReactantCore
 using SciMLBase: SciMLBase, AbstractNonlinearProblem, OptimizationProblem,
     ReturnCode, NonlinearFunction
 using SciMLJacobianOperators: VecJacOperator, JacVecOperator
@@ -58,7 +57,7 @@ The result returned by a line-search solve.
 
 - `step_size`: accepted step length for the current search direction.
 - `retcode`: a `SciMLBase.ReturnCode` describing whether the line search found
-  an acceptable step. Inside a Reactant compilation it is a traced return code.
+  an acceptable step.
 - `ϕ`: merit value at `step_size`, or `nothing` if the algorithm did not report
   it. Returning it lets the caller reuse the accepted point instead of
   re-evaluating the objective, which for an AD-defined problem is a full
@@ -78,7 +77,7 @@ sol.retcode
 """
 @concrete struct LineSearchSolution
     step_size
-    retcode
+    retcode::ReturnCode.T
     ϕ
     dϕ
 end
