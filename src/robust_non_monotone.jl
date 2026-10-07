@@ -32,6 +32,11 @@ Robust NonMonotone Line Search is a derivative free line search method from DF S
   - `maxiters`: the maximum number of iterations allowed for the inner loop of the
     algorithm. Defaults to `100`.
 
+The line search can be traced by `Reactant.@jit`/`@compile`, including inside a traced
+solver loop that carries its cache. The compiled search accepts the same step as the host
+one, but it evaluates both trial points of each iteration and does not count function
+evaluations in `stats`.
+
 # Examples
 
 ```julia
@@ -65,7 +70,7 @@ end
     M::Int
     τ_min
     τ_max
-    nsteps::Int
+    nsteps
     η_strategy
     n_exp::Int
     stats <: Union{SciMLBase.NLStats, Nothing}
@@ -79,6 +84,11 @@ function CommonSolve.init(
     @bb u_cache = similar(u)
     @bb fu_cache = similar(fu)
     T = promote_type(eltype(fu), eltype(u))
+    if ReactantCore.within_compile()
+        # `@bb similar` returns a traced array itself, and a traced solver loop carrying
+        # this cache rejects that aliasing.
+        u_cache, fu_cache = u .+ zero(eltype(u)), fu .+ zero(eltype(fu))
+    end
 
     ϕ = @closure (
         f, p, u, du, α, u_cache,
@@ -95,13 +105,14 @@ function CommonSolve.init(
 
     return RobustNonMonotoneLineSearchCache(
         prob.f, prob.p, ϕ, u_cache, fu_cache, T(1), alg.maxiters, fill(fn₁, alg.M),
-        T(alg.gamma), T(alg.sigma_1), alg.M, T(alg.tau_min), T(alg.tau_max), 0, η_strategy,
-        alg.n_exp, stats, alg
+        T(alg.gamma), T(alg.sigma_1), alg.M, T(alg.tau_min), T(alg.tau_max),
+        maybe_traced(0), η_strategy, alg.n_exp, stats, alg
     )
 end
 
 function CommonSolve.solve!(cache::RobustNonMonotoneLineSearchCache, u, du)
     T = promote_type(eltype(du), eltype(u))
+    ReactantCore.within_compile() && return solve_traced(cache, u, du, T)
     ϕ = @closure α -> cache.ϕ(cache.f, cache.p, u, du, α, cache.u_cache, cache.fu_cache)
 
     f_norm_old = ϕ(zero(T))
@@ -138,6 +149,15 @@ function CommonSolve.solve!(cache::RobustNonMonotoneLineSearchCache, u, du)
 end
 
 function callback_into_cache!(cache::RobustNonMonotoneLineSearchCache, fu)
+    if ReactantCore.within_compile()
+        # `mod(n - 1, M) + 1 == mod1(n, M)` without branching on the traced `n`
+        slot = mod(cache.nsteps - 1, cache.M) + 1
+        cache.history = ifelse.(
+            (1:(cache.M)) .== slot, norm(fu)^cache.n_exp, cache.history
+        )
+        cache.nsteps += 1
+        return
+    end
     cache.history[mod1(cache.nsteps, cache.M)] = norm(fu)^cache.n_exp
     cache.nsteps += 1
     return
@@ -152,7 +172,54 @@ function SciMLBase.reinit!(
     cache.M = oftype(cache.M, cache.alg.M)
     cache.τ_min = oftype(cache.τ_min, cache.alg.tau_min)
     cache.τ_max = oftype(cache.τ_max, cache.alg.tau_max)
-    cache.nsteps = 0
+    cache.nsteps = maybe_traced(0)
     # NOTE: Don't zero out the stats here, since we don't own it
     return cache
+end
+
+# Both trial points are evaluated in every iteration; the step the host loop would return
+# is then selected with `ifelse`. `stats` is not updated: the loop body is traced once.
+function solve_traced(cache::RobustNonMonotoneLineSearchCache, u, du, T)
+    (; f, p, n_exp, γ, τ_min, τ_max, maxiters) = cache
+    fu_buf = cache.fu_cache
+    f_norm_old = traced_merit(f, p, u, du, zero(T), fu_buf, n_exp)
+    η = cache.η_strategy(cache.nsteps, u, f_norm_old)
+    f_bar = maximum(cache.history)
+
+    σ₁ = T(cache.σ₁)
+    # `σ₁` is the traced scalar stored in the cache, and `@trace` writes its results back
+    # into the objects it carries, so the carried step lengths must be fresh values.
+    α₊ = σ₁ + zero(σ₁)
+    α₋ = σ₁ + zero(σ₁)
+    step = -α₋
+    accepted = ReactantCore.promote_to_traced(false)
+    iter = ReactantCore.promote_to_traced(0)
+
+    ReactantCore.@trace track_numbers = false while (iter < maxiters) & !accepted
+        f₊ = traced_merit(f, p, u, du, α₊, fu_buf, n_exp)
+        accept₊ = f₊ ≤ f_bar + η - γ * α₊ * f_norm_old
+        f₋ = traced_merit(f, p, u, du, -α₋, fu_buf, n_exp)
+        accept₋ = f₋ ≤ f_bar + η - γ * α₋ * f_norm_old
+
+        step = ifelse(accept₊, α₊, -α₋)
+        accepted = accept₊ | accept₋
+
+        α₊ = α₊ * clamp(
+            α₊ * f_norm_old / (f₊ + (2 * α₊ - 1) * f_norm_old), τ_min, τ_max
+        )
+        α₋ = α₋ * clamp(
+            α₋ * f_norm_old / (f₋ + (2 * α₋ - 1) * f_norm_old), τ_min, τ_max
+        )
+        iter = iter + 1
+    end
+
+    return LineSearchSolution(
+        ifelse(accepted, step, σ₁),
+        ifelse(accepted, ReturnCode.Success, ReturnCode.Failure)
+    )
+end
+
+function traced_merit(f, p, u, du, α, fu_buf, n_exp)
+    fu = evaluate_f!!(f, similar(fu_buf), u .+ α .* du, p)
+    return norm(fu)^n_exp
 end
