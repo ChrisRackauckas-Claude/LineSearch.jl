@@ -223,7 +223,9 @@ function solve_traced(cache::RobustNonMonotoneLineSearchCache, u, du, T)
 end
 
 function traced_merit(f, p, u, du, α, fu_buf, n_exp)
-    fu = evaluate_f!!(f, similar(fu_buf), u .+ α .* du, p)
+    # A fresh buffer per evaluation; out-of-place (and scalar) residuals need none.
+    buf = SciMLBase.isinplace(f) ? similar(fu_buf) : fu_buf
+    fu = evaluate_f!!(f, buf, u .+ α .* du, p)
     return scaled_norm(fu)^n_exp
 end
 

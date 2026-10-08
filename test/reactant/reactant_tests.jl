@@ -112,6 +112,23 @@ end
     end
 end
 
+# Expected values are those of the host loop in LineSearch v0.1.19.
+@testset "compiled line search on a scalar residual: $name" for (name, alg, α_expected, ok_expected) in (
+        ("unit step rejected", RobustNonMonotoneLineSearch(; n_exp = 1), 0.1, true),
+        ("maxiters reached", RobustNonMonotoneLineSearch(; n_exp = 1, maxiters = 1), 1.0, false),
+    )
+    u, du, p = 3.0, -60.0, 0.0
+    α_host, ok_host, history_host = line_search(linear, u, du, p, alg)
+    @test α_host == α_expected
+    @test ok_host == ok_expected
+    α_jit, ok_jit, history_jit = @jit line_search(
+        linear, Reactant.ConcreteRNumber(u), Reactant.ConcreteRNumber(du), p, alg
+    )
+    @test Float64(α_jit) == α_expected
+    @test Bool(ok_jit) == ok_expected
+    @test Array(history_jit) == history_host
+end
+
 @testset "compiled DF-SANE on u.^3 .- 2" begin
     u0 = [3.0, -2.0]
     maxiters = 50
